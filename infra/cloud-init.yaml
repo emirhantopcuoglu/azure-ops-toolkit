@@ -1,0 +1,32 @@
+#cloud-config
+package_update: true
+packages:
+  - docker.io
+  - nginx
+
+write_files:
+  - path: /opt/ops/nginx-default.conf
+    content: |
+      server {
+          listen 80 default_server;
+          # Hide the Nginx version from response headers and error pages
+          server_tokens off;
+
+          # Lightweight liveness probe used by `opsctl health`; never hits the app container
+          location /healthz {
+              default_type text/plain;
+              return 200 'ok';
+          }
+
+          location / {
+              proxy_pass http://127.0.0.1:8080;
+          }
+      }
+
+runcmd:
+  - systemctl enable --now docker
+  - usermod -aG docker azureuser
+  # Bind to loopback only so the container is reachable exclusively through Nginx
+  - docker run -d --restart unless-stopped --name web -p 127.0.0.1:8080:80 nginxdemos/hello
+  - cp /opt/ops/nginx-default.conf /etc/nginx/sites-available/default
+  - nginx -t && systemctl reload nginx
