@@ -1,0 +1,2 @@
+# Scripts and configs run on Linux (VM, containers, CI); CRLF breaks bash and cloud-init
+* text=auto eol=lf
