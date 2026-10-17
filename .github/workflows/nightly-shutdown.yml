@@ -1,0 +1,40 @@
+name: Nightly VM shutdown
+
+on:
+  schedule:
+    # Cron runs in UTC: 19:00 UTC is 22:00 in Turkey (UTC+3)
+    - cron: "0 19 * * *"
+  workflow_dispatch:
+
+permissions:
+  # Lets the job request a GitHub OIDC token, which Azure exchanges for an access token
+  id-token: write
+  contents: read
+
+jobs:
+  shutdown:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - run: pip install -r requirements.txt
+
+      - name: Sign in to Azure with OIDC (no client secret)
+        uses: azure/login@v3
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # DefaultAzureCredential picks up the Azure CLI session created by azure/login
+      - name: Deallocate VMs tagged for auto-shutdown
+        run: python -m opsctl vm stop --tag auto-shutdown=true
+        env:
+          AZURE_SUBSCRIPTION_ID: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+          RESOURCE_GROUP: rg-ops-toolkit
