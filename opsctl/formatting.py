@@ -4,6 +4,18 @@ from collections.abc import Sequence
 
 TABLE_COLUMN_GAP = "  "
 TAG_SEPARATOR = ";"
+BYTES_PER_UNIT_STEP = 1024
+BYTE_UNITS = ("B", "KB", "MB", "GB", "TB")
+
+
+def format_bytes(byte_count: float) -> str:
+    """Render a byte count with a binary (1024-based) unit, e.g. 50381 -> '49.2 KB'."""
+    value = float(byte_count)
+    for unit in BYTE_UNITS[:-1]:
+        if abs(value) < BYTES_PER_UNIT_STEP:
+            return f"{value:.0f} {unit}" if unit == "B" else f"{value:.1f} {unit}"
+        value /= BYTES_PER_UNIT_STEP
+    return f"{value:.1f} {BYTE_UNITS[-1]}"
 
 
 def format_tags(tags: dict[str, str]) -> str:
