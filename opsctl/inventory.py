@@ -9,10 +9,10 @@ from pathlib import Path
 
 from azure.mgmt.resource.resources import ResourceManagementClient
 
+from opsctl.formatting import format_tags, render_table
+
 TABLE_HEADERS = ("NAME", "TYPE", "LOCATION", "TAGS")
-TABLE_COLUMN_GAP = "  "
 CSV_FIELDS = ("name", "type", "location", "tags")
-TAG_SEPARATOR = ";"
 REPORT_FILENAME_PREFIX = "inventory"
 JSON_INDENT = 2
 
@@ -41,13 +41,7 @@ def list_resources(client: ResourceManagementClient, resource_group: str) -> lis
 
 
 def format_table(records: list[ResourceRecord]) -> str:
-    rows = [TABLE_HEADERS, *(_to_row(record) for record in records)]
-    column_widths = [max(len(row[index]) for row in rows) for index in range(len(TABLE_HEADERS))]
-    lines = [
-        TABLE_COLUMN_GAP.join(cell.ljust(width) for cell, width in zip(row, column_widths)).rstrip()
-        for row in rows
-    ]
-    return "\n".join(lines)
+    return render_table(TABLE_HEADERS, [_to_row(record) for record in records])
 
 
 def to_csv(records: list[ResourceRecord]) -> str:
@@ -75,8 +69,4 @@ def save_report(content: str, report_format: str, reports_dir: Path, generated_a
 
 
 def _to_row(record: ResourceRecord) -> tuple[str, str, str, str]:
-    return (record.name, record.type, record.location, _format_tags(record.tags))
-
-
-def _format_tags(tags: dict[str, str]) -> str:
-    return TAG_SEPARATOR.join(f"{key}={value}" for key, value in sorted(tags.items()))
+    return (record.name, record.type, record.location, format_tags(record.tags))
