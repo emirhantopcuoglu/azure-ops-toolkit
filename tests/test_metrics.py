@@ -11,6 +11,7 @@ from opsctl.metrics import (
     METRIC_NETWORK_IN,
     MetricStatus,
     MetricSummary,
+    build_alert_message,
     evaluate,
     fetch_metric_summaries,
     fetch_vm_metrics,
@@ -137,3 +138,9 @@ def test_format_metrics_table_handles_sdk_unit_enums():
     table = format_metrics_table({"vm-a": summaries}, CPU_THRESHOLD)
 
     assert "42.0%" in table
+
+
+def test_build_alert_message_returns_none_when_nothing_is_in_warn_state():
+    metrics_by_vm = {"vm-a": [MetricSummary(name=METRIC_CPU, unit="Percent", average=10.0, maximum=95.0)]}
+
+    assert build_alert_message(metrics_by_vm, CPU_THRESHOLD) is None

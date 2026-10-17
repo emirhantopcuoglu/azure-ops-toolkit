@@ -6,6 +6,7 @@ from azure.core.exceptions import ClientAuthenticationError, ResourceNotFoundErr
 
 import opsctl.__main__ as cli
 from opsctl.health import DnsResult, HttpResult
+from opsctl.notify import NotificationError
 
 VALID_SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
 
@@ -18,6 +19,7 @@ def isolated_environment(monkeypatch):
     monkeypatch.setenv("AZURE_SUBSCRIPTION_ID", VALID_SUBSCRIPTION_ID)
     monkeypatch.setenv("RESOURCE_GROUP", "rg-test")
     monkeypatch.delenv("CPU_THRESHOLD", raising=False)
+    monkeypatch.delenv("WEBHOOK_URL", raising=False)
 
 
 @pytest.fixture
@@ -256,3 +258,101 @@ def test_health_rejects_host_with_scheme_path_or_port(host):
         cli.main(["health", "--host", host])
 
     assert exit_info.value.code == 2
+
+
+WEBHOOK_URL = "https://discord.com/api/webhooks/123/secret-token"
+
+
+@pytest.fixture
+def sent_alerts(monkeypatch):
+    """Capture alerts instead of posting them; returns the list of (url, message) pairs."""
+    alerts = []
+    monkeypatch.setattr(cli, "send_webhook_message", lambda url, message: alerts.append((url, message)))
+    return alerts
+
+
+def _unhealthy_http(monkeypatch):
+    monkeypatch.setattr(cli, "check_dns", lambda host: DnsResult(host=host, ip_address=host, error=None))
+    monkeypatch.setattr(
+        cli, "check_http", lambda url: HttpResult(url=url, status_code=None, elapsed_ms=None, error="ConnectTimeout")
+    )
+
+
+def test_health_notify_sends_alert_describing_the_failure(monkeypatch, sent_alerts, capsys):
+    monkeypatch.setenv("WEBHOOK_URL", WEBHOOK_URL)
+    _unhealthy_http(monkeypatch)
+
+    exit_code = cli.main(["health", "--host", "20.0.0.1", "--notify"])
+
+    assert exit_code == cli.EXIT_FAILURE
+    assert sent_alerts == [
+        (WEBHOOK_URL, "opsctl health: 20.0.0.1 is unhealthy\nHTTP  http://20.0.0.1/healthz: FAIL (ConnectTimeout)")
+    ]
+    assert "Alert sent." in capsys.readouterr().out
+
+
+def test_health_notify_stays_silent_when_healthy(monkeypatch, sent_alerts):
+    monkeypatch.setenv("WEBHOOK_URL", WEBHOOK_URL)
+    monkeypatch.setattr(cli, "check_dns", lambda host: DnsResult(host=host, ip_address=host, error=None))
+    monkeypatch.setattr(cli, "check_http", lambda url: HttpResult(url=url, status_code=200, elapsed_ms=5.0, error=None))
+
+    exit_code = cli.main(["health", "--host", "20.0.0.1", "--notify"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    assert sent_alerts == []
+
+
+def test_notify_without_webhook_url_fails_before_running_checks(monkeypatch, capsys):
+    check_dns = Mock()
+    monkeypatch.setattr(cli, "check_dns", check_dns)
+
+    exit_code = cli.main(["health", "--host", "20.0.0.1", "--notify"])
+
+    assert exit_code == cli.EXIT_FAILURE
+    assert "WEBHOOK_URL is not set" in capsys.readouterr().err
+    check_dns.assert_not_called()
+
+
+def test_returns_failure_when_alert_cannot_be_sent(monkeypatch, capsys):
+    monkeypatch.setenv("WEBHOOK_URL", WEBHOOK_URL)
+    _unhealthy_http(monkeypatch)
+
+    def rejecting_send(url, message):
+        raise NotificationError("webhook rejected the message with status 404")
+
+    monkeypatch.setattr(cli, "send_webhook_message", rejecting_send)
+
+    exit_code = cli.main(["health", "--host", "20.0.0.1", "--notify"])
+
+    assert exit_code == cli.EXIT_FAILURE
+    assert "could not send alert: webhook rejected the message with status 404" in capsys.readouterr().err
+
+
+def test_metrics_notify_sends_alert_when_cpu_exceeds_threshold(compute_client, monkeypatch, sent_alerts):
+    # Arrange
+    monkeypatch.setenv("WEBHOOK_URL", WEBHOOK_URL)
+    compute_client.virtual_machines.list.return_value = [SimpleNamespace(name="vm-ops-01", id="/vms/vm-ops-01")]
+    monitor_client = MagicMock()
+    monitor_client.__enter__.return_value = monitor_client
+    monitor_client.metrics.list.return_value = SimpleNamespace(
+        value=[
+            SimpleNamespace(
+                name=SimpleNamespace(value="Percentage CPU"),
+                unit="Percent",
+                timeseries=[SimpleNamespace(data=[SimpleNamespace(average=92.0, maximum=99.0)])],
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "MonitorManagementClient", Mock(return_value=monitor_client))
+
+    # Act
+    exit_code = cli.main(["metrics", "--notify"])
+
+    # Assert
+    assert exit_code == cli.EXIT_SUCCESS
+    assert sent_alerts == [
+        (
+            WEBHOOK_URL,
+            "opsctl metrics: threshold exceeded in the last hour\n- vm-ops-01: Percentage CPU average 92.0% > 80%",
+        )
+    ]

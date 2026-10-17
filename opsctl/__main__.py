@@ -18,7 +18,14 @@ from dotenv import load_dotenv
 from opsctl.config import Config, ConfigError, load_config
 from opsctl.health import check_dns, check_http, health_url
 from opsctl.inventory import REPORT_SERIALIZERS, format_table, list_resources, save_report
-from opsctl.metrics import MetricStatus, evaluate, fetch_vm_metrics, format_metrics_table
+from opsctl.metrics import (
+    MetricStatus,
+    build_alert_message,
+    evaluate,
+    fetch_vm_metrics,
+    format_metrics_table,
+)
+from opsctl.notify import NotificationError, send_webhook_message
 from opsctl.vms import (
     PowerAction,
     apply_power_action,
@@ -46,6 +53,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             exit_code = args.handler(args, config, credential)
     except ConfigError as error:
         _print_error(f"configuration error: {error}")
+        return EXIT_FAILURE
+    except NotificationError as error:
+        _print_error(f"could not send alert: {error}")
         return EXIT_FAILURE
     # ClientAuthenticationError subclasses HttpResponseError, so it must be caught first
     except ClientAuthenticationError as error:
@@ -78,7 +88,14 @@ def _add_health_command(subcommands: argparse._SubParsersAction) -> None:
     health_parser.add_argument(
         "--host", required=True, type=_parse_host, help="hostname or IP address of the server"
     )
+    _add_notify_argument(health_parser)
     health_parser.set_defaults(handler=_run_health)
+
+
+def _add_notify_argument(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument(
+        "--notify", action="store_true", help="send an alert to WEBHOOK_URL when a problem is found"
+    )
 
 
 def _parse_host(text: str) -> str:
@@ -92,6 +109,7 @@ def _add_metrics_command(subcommands: argparse._SubParsersAction) -> None:
     metrics_parser = subcommands.add_parser(
         "metrics", help="show last-hour CPU, network and disk metrics with a CPU threshold check"
     )
+    _add_notify_argument(metrics_parser)
     metrics_parser.set_defaults(handler=_run_metrics)
 
 
@@ -191,6 +209,7 @@ def _run_vm_power_action(args: argparse.Namespace, config: Config, credential: T
 
 
 def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
+    webhook_url = _webhook_url_if_requested(args, config)
     with (
         ComputeManagementClient(credential, config.subscription_id) as compute_client,
         MonitorManagementClient(credential, config.subscription_id) as monitor_client,
@@ -213,23 +232,54 @@ def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCred
         print(f"\nCPU average above {config.cpu_threshold_percent:g}% threshold.")
     if MetricStatus.NO_DATA in statuses:
         print("\nSome metrics have no data yet; a VM that just started needs a few minutes.")
+
+    alert_message = build_alert_message(metrics_by_vm, config.cpu_threshold_percent)
+    if webhook_url and alert_message:
+        _send_alert(webhook_url, alert_message)
     return EXIT_SUCCESS
 
 
 def _run_health(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
-    dns_result = check_dns(args.host)
-    if not dns_result.is_healthy:
-        print(f"DNS   {args.host}: FAIL ({dns_result.error})")
-        return EXIT_FAILURE
-    print(f"DNS   {args.host} -> {dns_result.ip_address}: OK")
+    webhook_url = _webhook_url_if_requested(args, config)
+    failure = _check_health(args.host)
+    if failure is None:
+        return EXIT_SUCCESS
+    if webhook_url:
+        _send_alert(webhook_url, f"opsctl health: {args.host} is unhealthy\n{failure}")
+    return EXIT_FAILURE
 
-    http_result = check_http(health_url(args.host))
+
+def _check_health(host: str) -> str | None:
+    """Print the result of each check and return the first failure, or None if healthy."""
+    dns_result = check_dns(host)
+    if not dns_result.is_healthy:
+        failure = f"DNS   {host}: FAIL ({dns_result.error})"
+        print(failure)
+        return failure
+    print(f"DNS   {host} -> {dns_result.ip_address}: OK")
+
+    http_result = check_http(health_url(host))
     if not http_result.is_healthy:
         reason = http_result.error or f"status {http_result.status_code}"
-        print(f"HTTP  {http_result.url}: FAIL ({reason})")
-        return EXIT_FAILURE
+        failure = f"HTTP  {http_result.url}: FAIL ({reason})"
+        print(failure)
+        return failure
     print(f"HTTP  {http_result.url}: OK ({http_result.status_code}, {http_result.elapsed_ms:.0f} ms)")
-    return EXIT_SUCCESS
+    return None
+
+
+def _webhook_url_if_requested(args: argparse.Namespace, config: Config) -> str | None:
+    """Fail before doing any work when --notify is given without a webhook configured."""
+    if not args.notify:
+        return None
+    if config.webhook_url is None:
+        raise ConfigError("WEBHOOK_URL is not set; it is required for --notify")
+    return config.webhook_url
+
+
+def _send_alert(webhook_url: str, message: str) -> None:
+    send_webhook_message(webhook_url, message)
+    print("Alert sent.")
 
 
 def _print_error(message: str) -> None:
