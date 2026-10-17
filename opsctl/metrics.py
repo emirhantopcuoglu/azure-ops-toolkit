@@ -96,6 +96,22 @@ def format_metrics_table(metrics_by_vm: dict[str, list[MetricSummary]], cpu_thre
     return render_table(TABLE_HEADERS, rows)
 
 
+def build_alert_message(
+    metrics_by_vm: dict[str, list[MetricSummary]], cpu_threshold_percent: float
+) -> str | None:
+    """Describe every metric in WARN state, or return None when there is nothing to report."""
+    warnings = [
+        f"- {vm_name}: {summary.name} average "
+        f"{_format_value(summary.average, summary.unit)} > {cpu_threshold_percent:g}%"
+        for vm_name, summaries in metrics_by_vm.items()
+        for summary in summaries
+        if evaluate(summary, cpu_threshold_percent) is MetricStatus.WARN
+    ]
+    if not warnings:
+        return None
+    return "opsctl metrics: threshold exceeded in the last hour\n" + "\n".join(warnings)
+
+
 def _summarize(metric) -> MetricSummary:
     points = [point for series in metric.timeseries for point in series.data]
     # Intervals before the VM started have no value; None means "no data", not zero
