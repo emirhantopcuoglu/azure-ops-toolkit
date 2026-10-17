@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the opsctl report hourly
+
+[Timer]
+OnCalendar=hourly
+# If the VM was off when a run was due (e.g. deallocated overnight), run once on boot
+Persistent=true
+
+[Install]
+WantedBy=timers.target

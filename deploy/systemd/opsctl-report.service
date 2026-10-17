@@ -1,0 +1,11 @@
+[Unit]
+Description=opsctl metrics report with webhook alerts
+# Docker must be running and the network up before the report can query Azure
+Requires=docker.service
+After=docker.service network-online.target
+Wants=network-online.target
+
+[Service]
+# Runs once to completion each time the timer fires; it is not a long-lived daemon
+Type=oneshot
+ExecStart=/usr/bin/docker run --rm --env-file /opt/opsctl/.env opsctl metrics --notify
