@@ -1,57 +1,83 @@
 # azure-ops-toolkit
 
-A small Azure infrastructure and a Python operations CLI (`opsctl`) that manages it.
-
-The infrastructure is a single Ubuntu VM that configures itself on first boot: Docker runs a demo web container and Nginx sits in front of it as a reverse proxy. Everything is created by one script, so the environment can be torn down and rebuilt identically at any time.
+Azure infrastructure scripts and a Python CLI (`opsctl`) for operating a small Ubuntu VM environment: resource inventory, tag-based VM power management, Azure Monitor metrics with a CPU threshold, HTTP/DNS health checks and webhook alerts. The VM runs the CLI hourly through a systemd timer, and a GitHub Actions workflow deallocates it nightly using OIDC federation.
 
 ## Architecture
 
 ```
-Internet
-   │  HTTP :80
-   ▼
-┌──────────────── Resource group: rg-ops-toolkit ────────────────┐
-│  Network Security Group (allows 22/SSH, 80/HTTP)               │
-│  ┌──────────────────── VM: vm-ops-01 (Ubuntu 22.04) ─────────┐ │
-│  │  Nginx :80                                                │ │
-│  │   ├── /healthz  →  200 "ok" (answered by Nginx itself)    │ │
-│  │   └── /         →  proxy_pass 127.0.0.1:8080              │ │
-│  │                       │                                   │ │
-│  │                       ▼                                   │ │
-│  │               Docker container "web" (nginxdemos/hello)   │ │
-│  │                                                           │ │
-│  │  System-assigned managed identity → Reader on the RG      │ │
-│  └───────────────────────────────────────────────────────────┘ │
-└────────────────────────────────────────────────────────────────┘
+GitHub Actions (nightly, 19:00 UTC)
+  └─ azure/login (OIDC) ─► opsctl vm stop --tag auto-shutdown=true
+                                   │
+Azure: rg-ops-toolkit              ▼
+  NSG (22, 80)
+  vm-ops-01 (Ubuntu 22.04, cloud-init)
+    Nginx :80 ─┬─ /healthz ─► 200 "ok"
+               └─ /        ─► container "web" (127.0.0.1:8080)
+    systemd timer (hourly) ─► docker run opsctl metrics --notify
+                                │  managed identity (Reader on RG)
+                                ├─► Azure Monitor metrics
+                                └─► Discord/Slack webhook on WARN
 ```
 
-## Repository layout
+## Screenshots
+
+`opsctl vm status`, `metrics` and `health`:
+
+![vm status](docs/images/cli-vm-status.png)
+
+![metrics](docs/images/cli-metrics.png)
+
+![health](docs/images/cli-health.png)
+
+Webhook alert:
+
+![Discord alert](docs/images/discord-alert.png)
+
+Hourly report on the VM:
+
+![systemd timer](docs/images/systemd-timer.png)
+
+Nightly shutdown workflow:
+
+![GitHub Actions run](docs/images/actions-nightly-shutdown.png)
+
+## Project structure
 
 ```
 infra/
-  cloud-init.yaml   # First-boot configuration: Docker, Nginx, demo container
-  provision.sh      # Creates the resource group, VM, firewall rule and identity
-.env.example        # Environment variables the tooling expects
+  provision.sh            resource group, VM, NSG rule, managed identity
+  cloud-init.yaml         Docker, Nginx and demo container on first boot
+  setup-github-oidc.sh    app registration and federated credential for GitHub Actions
+  teardown.sh             deletes all project resources
+opsctl/
+  __main__.py             CLI entry point
+  config.py               environment configuration
+  inventory.py            resource listing, CSV/JSON export
+  vms.py                  power state, tag-based start/stop
+  metrics.py              Azure Monitor metrics, CPU threshold
+  health.py               DNS and HTTP checks
+  notify.py               Discord/Slack webhooks
+  formatting.py           table and unit formatting
+tests/                    unit tests
+deploy/systemd/           opsctl-report.service, opsctl-report.timer
+.github/workflows/        nightly-shutdown.yml
+Dockerfile
 ```
 
-## Prerequisites
+## Requirements
 
-- An Azure subscription. A budget alert is strongly recommended (Cost Management → Budgets, e.g. 5 USD with alerts at 50/80/100%): a forgotten cloud resource keeps billing silently.
-- [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), logged in with `az login`
-- Bash (Linux, macOS, or Git Bash on Windows)
-- Python 3.11+
+- Azure subscription
+- Azure CLI (`az login`)
+- GitHub CLI (`gh auth login`), for OIDC setup and teardown
+- Bash, Python 3.14, Docker
 
-## Configuration
+## Setup
 
-Copy `.env.example` to `.env` and fill in the values. `.env` is git-ignored and must never be committed.
+### Infrastructure
 
-| Variable | Purpose |
-|---|---|
-| `AZURE_SUBSCRIPTION_ID` | Subscription the tooling operates on (`az account show --query id -o tsv`) |
-| `RESOURCE_GROUP` | Resource group holding all project resources (default `rg-ops-toolkit`) |
-| `WEBHOOK_URL` | Discord/Slack webhook for notifications |
-
-`provision.sh` reads its settings from environment variables with sensible defaults, so the same script works in a different region or size without editing it:
+```bash
+bash infra/provision.sh
+```
 
 | Variable | Default |
 |---|---|
@@ -60,139 +86,105 @@ Copy `.env.example` to `.env` and fill in the values. `.env` is git-ignored and 
 | `VM_NAME` | `vm-ops-01` |
 | `VM_SIZE` | `Standard_B2ats_v2` |
 
-## Provisioning
+The script registers the `Microsoft.Insights` provider, creates the VM with `infra/cloud-init.yaml` as custom data, opens port 80 and assigns a system-assigned managed identity with `Reader` on the resource group. cloud-init finishes a few minutes after the VM starts (`cloud-init status --wait`).
+
+### CLI
 
 ```bash
-bash infra/provision.sh
-# or override defaults:
-LOCATION=uksouth VM_SIZE=Standard_B1s bash infra/provision.sh
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements-dev.txt
+cp .env.example .env
 ```
 
-The script runs with `set -euo pipefail`: it stops at the first failing command (`-e`), treats unset variables as errors (`-u`) and fails a pipeline if any command in it fails (`pipefail`). Without this, Bash would continue after a failed VM creation and produce a chain of confusing follow-up errors.
+| Variable | Description |
+|---|---|
+| `AZURE_SUBSCRIPTION_ID` | Target subscription |
+| `RESOURCE_GROUP` | Default `rg-ops-toolkit` |
+| `WEBHOOK_URL` | Discord or Slack incoming webhook |
+| `CPU_THRESHOLD` | CPU average (%) for WARN, default `80` |
 
-It performs these steps:
+Authentication uses `DefaultAzureCredential`: the Azure CLI session locally, the managed identity on the VM, the `azure/login` session in GitHub Actions.
 
-1. **Create the resource group** with `project` and `env` tags. A resource group is a container for related resources; deleting it deletes everything inside, which reduces cleanup to a single command. Tags are used for cost tracking and for selecting resources in automation.
-2. **Create the VM** (Ubuntu 22.04 LTS) with SSH key authentication and the cloud-init file as custom data. The VM is tagged `env=dev auto-shutdown=true role=web`.
-3. **Open port 80** by adding a rule to the VM's Network Security Group (Azure's firewall). SSH (22) is open by default on Linux VMs.
-4. **Assign a managed identity** with the `Reader` role scoped to the resource group.
-5. **Print the public IP** along with ready-to-use SSH and health check commands.
-
-When it finishes the VM is running, but cloud-init needs a few more minutes to install packages. See [Verifying the deployment](#verifying-the-deployment).
-
-## How it works
-
-### cloud-init: configuration as code
-
-[cloud-init](https://cloudinit.readthedocs.io/) ships with Ubuntu cloud images and runs **once, on the first boot**, applying the YAML passed as custom data. Instead of SSH-ing in and installing things by hand, the setup lives in version control: it is reviewable, repeatable and identical on every VM.
-
-`infra/cloud-init.yaml`:
-
-- `package_update` / `packages`: runs `apt update`, installs `docker.io` and `nginx`.
-- `write_files`: writes the Nginx site configuration to disk.
-- `runcmd`, executed in order:
-  1. `systemctl enable --now docker`: start Docker now and on every boot.
-  2. `usermod -aG docker azureuser`: allow the admin user to run Docker without `sudo`.
-  3. `docker run -d --restart unless-stopped --name web -p 127.0.0.1:8080:80 nginxdemos/hello`: run the demo app in the background, restart it automatically after crashes or reboots.
-  4. Copy the Nginx config into place.
-  5. `nginx -t && systemctl reload nginx`: validate the configuration and reload only if it is valid, so a broken config never takes the server down.
-
-### Reverse proxy and loopback binding
-
-The container publishes its port as `127.0.0.1:8080`, not `8080`. Binding to the loopback interface means the container is reachable **only from inside the VM**; all external traffic has to go through Nginx. Nginx is the single public entry point, which is where TLS, rate limiting or access rules would be added later.
-
-### Health endpoint
-
-`/healthz` is answered by Nginx directly with `200 ok` and never reaches the container. It is a cheap liveness probe for monitoring.
-
-The response type is set with `default_type text/plain;`. Using `add_header Content-Type text/plain` instead would send a second, conflicting `Content-Type` header next to the one Nginx already emits.
-
-### Hiding the server version
-
-`server_tokens off;` changes the `Server` response header from `nginx/1.18.0 (Ubuntu)` to `nginx`. Advertising exact versions helps an attacker look up known vulnerabilities.
-
-### SSH key authentication
-
-`--generate-ssh-keys` creates `~/.ssh/id_rsa` (private, stays on your machine) and `~/.ssh/id_rsa.pub` (copied to the VM) if they do not exist. Key-based login cannot be guessed or brute-forced like a password.
-
-On the first connection SSH asks you to confirm the server's fingerprint and stores it in `~/.ssh/known_hosts`. If the fingerprint changes later, SSH warns you: someone may be impersonating the server (man-in-the-middle).
-
-### Managed identity and least privilege
-
-The VM gets a **system-assigned managed identity**: an Azure-managed identity tied to the VM's lifecycle. Code running on the VM can request short-lived tokens for Azure APIs without any password or key stored on disk, so there is nothing to leak, rotate or accidentally commit.
-
-The identity is granted `Reader` only, and only on `rg-ops-toolkit`. This follows the **principle of least privilege**: the monitoring code only needs to read, so if the VM were compromised the attacker could neither change resources nor see anything outside this resource group.
-
-## Verifying the deployment
-
-From your machine:
+## Usage
 
 ```bash
-curl -i http://<PUBLIC_IP>/healthz   # 200, Content-Type: text/plain, body "ok"
+python -m opsctl inventory [--output csv|json]
+python -m opsctl vm status
+python -m opsctl vm start --tag auto-shutdown=true [--dry-run]
+python -m opsctl vm stop  --tag auto-shutdown=true [--dry-run]
+python -m opsctl metrics [--notify]
+python -m opsctl health --host <PUBLIC_IP> [--notify]
 ```
 
-Opening `http://<PUBLIC_IP>` in a browser shows the demo page served by the container through Nginx.
+- `inventory --output` writes `reports/inventory-<UTC timestamp>.<csv|json>`.
+- `vm stop` deallocates VMs. VMs already in the target state are skipped.
+- `metrics` reports the last-hour average and maximum of `Percentage CPU`, `Network In Total` and `Disk Read Bytes` per VM. The CPU average is compared with `CPU_THRESHOLD`.
+- `health` resolves the host and requests `/healthz` with a 5 s timeout.
+- `--notify` sends a webhook message only when a check fails or a threshold is exceeded.
+- Exit code is `1` on configuration, authentication, Azure, health or notification failures.
 
-On the VM (`ssh azureuser@<PUBLIC_IP>`):
+## Docker
 
 ```bash
-cloud-init status --wait        # blocks until first-boot setup finishes; expect "status: done"
-systemctl status nginx docker   # both should be "active (running)"
-docker ps                       # "web" container with 127.0.0.1:8080->80/tcp
-curl localhost/healthz          # ok
+docker build -t opsctl .
+docker run --rm --env-file .env opsctl health --host <PUBLIC_IP>
 ```
 
-If cloud-init reports an error, the full log is in `/var/log/cloud-init-output.log`.
+The image is based on `python:3.14-slim` and runs as a non-root user.
 
-## Server health basics
+## Scheduled jobs
 
-Commands for a first look at a Linux server's resources, with observations from this VM (Standard_B2ats_v2, 1 GB RAM):
-
-- **`df -h`**: disk usage per filesystem in human-readable units. The line to watch is `/` (root filesystem): 2.4 GB used out of 29 GB (9%) after installing Docker, Nginx and the demo image. `tmpfs` entries live in RAM and are cleared on reboot; they are not disk usage. A full root disk stops logging and crashes services.
-- **`free -m`**: memory in MB. `total` is 891 rather than 1024 because the kernel reserves part of the memory at boot. `free` was only 116 but `available` was 437: Linux uses idle memory as disk cache (`buff/cache`) and releases it as soon as a process needs it, so `available` is the number that matters. There is no swap on Azure Ubuntu images by default; when memory runs out the kernel's OOM killer terminates the largest process.
-- **`htop`**: live per-process CPU and memory usage, with per-core CPU bars at the top.
-- **`sudo journalctl -u nginx`**: logs of the Nginx systemd unit. systemd collects the logs of every service in one place, queryable by unit.
-
-## Region and VM size
-
-Small, cheap VM sizes are in high demand and availability changes over time:
-
-- `westeurope` rejected the deployment with `RequestDisallowedByAzure`: the region was not accepting new subscriptions.
-- `Standard_B1s` failed with `SkuNotAvailable` (capacity restrictions) in several EU regions.
-
-`az vm list-skus` only shows permanent restrictions, not current capacity. A reliable check that creates nothing is a preflight validation:
+### Hourly report (VM)
 
 ```bash
-az vm create -g rg-ops-toolkit -n probe -l <region> --size <size> \
-  --image Ubuntu2204 --admin-username azureuser \
-  --ssh-key-values ~/.ssh/id_rsa.pub --validate
+docker build -t opsctl .
+sudo mkdir -p /opt/opsctl
+sudo nano /opt/opsctl/.env
+sudo chmod 600 /opt/opsctl/.env
+sudo cp deploy/systemd/opsctl-report.* /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now opsctl-report.timer
 ```
-
-`Standard_B2ats_v2` (2 vCPU AMD, 1 GB RAM, burstable) in `swedencentral` passed, so it is the default. B-series sizes accumulate CPU credits while idle and spend them under load, which suits low-traffic workloads.
-
-A resource group's location cannot be changed after creation. When switching regions, delete the (empty) group and run the script again.
-
-## Running on Windows (Git Bash)
-
-Git Bash converts arguments that start with `/` into Windows paths when calling Windows programs such as `az`. An Azure resource ID like `/subscriptions/...` would become `C:/Program Files/Git/subscriptions/...`. `provision.sh` disables this conversion with `MSYS_NO_PATHCONV=1` only for the role assignment, because the cloud-init file path *does* need converting. On Linux the variable has no effect.
-
-In PowerShell, `bash` may resolve to WSL rather than Git Bash; WSL does not see the Windows Azure CLI installation.
-
-## Cost control
-
-Stop the VM when not in use:
 
 ```bash
-az vm deallocate -g rg-ops-toolkit -n vm-ops-01   # releases the hardware; compute billing stops
-az vm start      -g rg-ops-toolkit -n vm-ops-01
+systemctl list-timers opsctl-report.timer
+journalctl -u opsctl-report
 ```
 
-`az vm stop` only shuts down the OS: the hardware stays reserved and **is still billed**. Use `deallocate`. The disk and public IP keep incurring small charges while deallocated.
-
-## Cleanup
-
-Delete everything the project created:
+### Nightly shutdown (GitHub Actions)
 
 ```bash
-az group delete -n rg-ops-toolkit --yes
+bash infra/setup-github-oidc.sh
+gh secret set AZURE_CLIENT_ID --body <client-id>
+gh secret set AZURE_TENANT_ID --body <tenant-id>
+gh secret set AZURE_SUBSCRIPTION_ID --body <subscription-id>
 ```
+
+The workflow runs at 19:00 UTC and on `workflow_dispatch`. It authenticates through a federated credential trusted for the `main` branch, with `Virtual Machine Contributor` on the resource group. No client secret is created.
+
+## Tests
+
+```bash
+python -m pytest
+```
+
+Unit tests mock the Azure SDK clients, HTTP, DNS and time, and do not require network access.
+
+## Teardown
+
+```bash
+bash infra/teardown.sh
+```
+
+Deletes the resource group and the GitHub Actions app registration, and disables the nightly workflow.
+
+## Known issues
+
+| Error | Resolution |
+|---|---|
+| `RequestDisallowedByAzure` (region not accepting new customers) | Use another region. Delete the resource group first; its location cannot be changed. |
+| `SkuNotAvailable` | Try another size or region. `az vm create ... --validate` checks capacity without creating resources. |
+| `Failed to find resource mapping for provider` | `Microsoft.Insights` is not registered, or registration is still propagating. |
+| `AADSTS700213` | The OIDC subject does not match. Repositories with immutable subjects use `repo:owner@<id>/name@<id>`; `setup-github-oidc.sh` reads it from the GitHub API. |
+| Resource IDs rewritten to `C:/Program Files/Git/...` | Git Bash path conversion. Disabled with `MSYS_NO_PATHCONV=1` where needed. |
