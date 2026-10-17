@@ -92,3 +92,94 @@ def test_rejects_unknown_output_format():
         cli.main(["inventory", "--output", "xml"])
 
     assert exit_info.value.code == 2
+
+
+@pytest.fixture
+def compute_client(monkeypatch):
+    """Replace ComputeManagementClient with a mock and return that mock."""
+    client = MagicMock()
+    client.__enter__.return_value = client
+    monkeypatch.setattr(cli, "ComputeManagementClient", Mock(return_value=client))
+    return client
+
+
+def test_vm_status_prints_power_state_table(compute_client, capsys):
+    compute_client.virtual_machines.list.return_value = [SimpleNamespace(name="vm-ops-01", tags={})]
+    compute_client.virtual_machines.instance_view.return_value = SimpleNamespace(
+        statuses=[SimpleNamespace(code="PowerState/deallocated")]
+    )
+
+    exit_code = cli.main(["vm", "status"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    assert "vm-ops-01  deallocated" in capsys.readouterr().out
+
+
+def test_vm_status_reports_resource_group_without_vms(compute_client, capsys):
+    compute_client.virtual_machines.list.return_value = []
+
+    exit_code = cli.main(["vm", "status"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    assert "No virtual machines found in rg-test" in capsys.readouterr().out
+
+
+def _set_vms(compute_client, power_states_by_name, tags):
+    compute_client.virtual_machines.list.return_value = [
+        SimpleNamespace(name=name, tags=tags) for name in power_states_by_name
+    ]
+    compute_client.virtual_machines.instance_view.side_effect = lambda resource_group, vm_name: (
+        SimpleNamespace(statuses=[SimpleNamespace(code=f"PowerState/{power_states_by_name[vm_name]}")])
+    )
+
+
+def test_vm_stop_dry_run_reports_plan_without_changing_anything(compute_client, capsys):
+    _set_vms(compute_client, {"vm-ops-01": "running"}, tags={"auto-shutdown": "true"})
+
+    exit_code = cli.main(["vm", "stop", "--tag", "auto-shutdown=true", "--dry-run"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    assert "[dry-run] would deallocate vm-ops-01 (currently running)" in capsys.readouterr().out
+    compute_client.virtual_machines.begin_deallocate.assert_not_called()
+
+
+def test_vm_stop_deallocates_only_vms_that_are_not_already_deallocated(compute_client, capsys):
+    _set_vms(
+        compute_client,
+        {"vm-running": "running", "vm-idle": "deallocated"},
+        tags={"auto-shutdown": "true"},
+    )
+
+    exit_code = cli.main(["vm", "stop", "--tag", "auto-shutdown=true"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    compute_client.virtual_machines.begin_deallocate.assert_called_once_with("rg-test", "vm-running")
+    output = capsys.readouterr().out
+    assert "vm-idle: already deallocated, skipping" in output
+    assert "Deallocating vm-running..." in output
+
+
+def test_vm_start_ignores_vms_without_the_tag(compute_client, capsys):
+    _set_vms(compute_client, {"vm-ops-01": "deallocated"}, tags={"auto-shutdown": "false"})
+
+    exit_code = cli.main(["vm", "start", "--tag", "auto-shutdown=true"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    assert "No VMs tagged auto-shutdown=true in rg-test" in capsys.readouterr().out
+    compute_client.virtual_machines.begin_start.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["vm", "stop"],
+        ["vm", "stop", "--tag", "auto-shutdown"],
+        ["vm", "stop", "--tag", "=true"],
+        ["vm", "stop", "--tag", "auto-shutdown="],
+    ],
+)
+def test_vm_power_commands_require_a_key_value_tag(arguments):
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(arguments)
+
+    assert exit_info.value.code == 2
