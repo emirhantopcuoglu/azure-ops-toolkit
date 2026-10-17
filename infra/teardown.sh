@@ -18,7 +18,10 @@ if [[ "${1:-}" != "--yes" ]]; then
   fi
 fi
 
-if [[ "$(az group exists --name "${RESOURCE_GROUP}")" == "true" ]]; then
+# Command substitutions are assigned before being tested: inside [[ ]] a failing command
+# does not trigger set -e and would silently read as "not found"
+RESOURCE_GROUP_EXISTS="$(az group exists --name "${RESOURCE_GROUP}")"
+if [[ "${RESOURCE_GROUP_EXISTS}" == "true" ]]; then
   # Waits for completion (unlike --no-wait) so the script only reports success once
   # the billable resources are actually gone. Role assignments scoped to the group go with it.
   echo "Deleting resource group '${RESOURCE_GROUP}' (this takes several minutes)..."
@@ -37,7 +40,9 @@ else
 fi
 
 # Without its identity the scheduled workflow would fail every night
-if [[ "$(gh workflow view "${WORKFLOW_NAME}" --json state --jq .state)" == "active" ]]; then
+WORKFLOW_STATE="$(gh workflow list --all --json name,state \
+  --jq ".[] | select(.name == \"${WORKFLOW_NAME}\") | .state")"
+if [[ "${WORKFLOW_STATE}" == "active" ]]; then
   echo "Disabling workflow '${WORKFLOW_NAME}'..."
   gh workflow disable "${WORKFLOW_NAME}"
 fi
