@@ -92,3 +92,33 @@ def test_rejects_unknown_output_format():
         cli.main(["inventory", "--output", "xml"])
 
     assert exit_info.value.code == 2
+
+
+@pytest.fixture
+def compute_client(monkeypatch):
+    """Replace ComputeManagementClient with a mock and return that mock."""
+    client = MagicMock()
+    client.__enter__.return_value = client
+    monkeypatch.setattr(cli, "ComputeManagementClient", Mock(return_value=client))
+    return client
+
+
+def test_vm_status_prints_power_state_table(compute_client, capsys):
+    compute_client.virtual_machines.list.return_value = [SimpleNamespace(name="vm-ops-01", tags={})]
+    compute_client.virtual_machines.instance_view.return_value = SimpleNamespace(
+        statuses=[SimpleNamespace(code="PowerState/deallocated")]
+    )
+
+    exit_code = cli.main(["vm", "status"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    assert "vm-ops-01  deallocated" in capsys.readouterr().out
+
+
+def test_vm_status_reports_resource_group_without_vms(compute_client, capsys):
+    compute_client.virtual_machines.list.return_value = []
+
+    exit_code = cli.main(["vm", "status"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    assert "No virtual machines found in rg-test" in capsys.readouterr().out

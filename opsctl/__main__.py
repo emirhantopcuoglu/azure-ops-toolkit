@@ -10,11 +10,13 @@ from pathlib import Path
 from azure.core.credentials import TokenCredential
 from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from azure.identity import DefaultAzureCredential
+from azure.mgmt.compute import ComputeManagementClient
 from azure.mgmt.resource.resources import ResourceManagementClient
 from dotenv import load_dotenv
 
 from opsctl.config import Config, ConfigError, load_config
 from opsctl.inventory import REPORT_SERIALIZERS, format_table, list_resources, save_report
+from opsctl.vms import format_status_table, list_vm_states
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -50,7 +52,12 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Operations toolkit for the azure-ops-toolkit environment.",
     )
     subcommands = parser.add_subparsers(dest="command", required=True)
+    _add_inventory_command(subcommands)
+    _add_vm_commands(subcommands)
+    return parser
 
+
+def _add_inventory_command(subcommands: argparse._SubParsersAction) -> None:
     inventory_parser = subcommands.add_parser("inventory", help="list resources in the resource group")
     inventory_parser.add_argument(
         "--output",
@@ -59,7 +66,13 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     inventory_parser.set_defaults(handler=_run_inventory)
 
-    return parser
+
+def _add_vm_commands(subcommands: argparse._SubParsersAction) -> None:
+    vm_parser = subcommands.add_parser("vm", help="inspect and control virtual machines")
+    vm_subcommands = vm_parser.add_subparsers(dest="vm_command", required=True)
+
+    status_parser = vm_subcommands.add_parser("status", help="show the power state of each VM")
+    status_parser.set_defaults(handler=_run_vm_status)
 
 
 def _run_inventory(args: argparse.Namespace, config: Config, credential: TokenCredential) -> None:
@@ -75,6 +88,17 @@ def _run_inventory(args: argparse.Namespace, config: Config, credential: TokenCr
         content = REPORT_SERIALIZERS[args.output](records)
         report_path = save_report(content, args.output, REPORTS_DIR, datetime.now(timezone.utc))
         print(f"\nSaved {args.output.upper()} report to {report_path}")
+
+
+def _run_vm_status(args: argparse.Namespace, config: Config, credential: TokenCredential) -> None:
+    with ComputeManagementClient(credential, config.subscription_id) as client:
+        states = list_vm_states(client, config.resource_group)
+
+    if not states:
+        print(f"No virtual machines found in {config.resource_group}.")
+        return
+
+    print(format_status_table(states))
 
 
 def _print_error(message: str) -> None:
