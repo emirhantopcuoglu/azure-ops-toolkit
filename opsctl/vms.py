@@ -2,6 +2,7 @@
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import Enum
 
 from azure.mgmt.compute import ComputeManagementClient
 
@@ -10,6 +11,19 @@ from opsctl.formatting import format_tags, render_table
 POWER_STATE_PREFIX = "PowerState/"
 UNKNOWN_POWER_STATE = "unknown"
 STATUS_TABLE_HEADERS = ("NAME", "POWER STATE", "TAGS")
+
+
+class PowerAction(Enum):
+    START = "start"
+    # Deallocate rather than power off: a powered-off VM keeps its hardware reserved
+    # and is still billed for compute, a deallocated one is not.
+    DEALLOCATE = "deallocate"
+
+
+TARGET_POWER_STATES = {
+    PowerAction.START: "running",
+    PowerAction.DEALLOCATE: "deallocated",
+}
 
 
 @dataclass(frozen=True)
@@ -43,6 +57,29 @@ def list_vm_states(client: ComputeManagementClient, resource_group: str) -> list
 def format_status_table(states: list[VmState]) -> str:
     rows = [(state.name, state.power_state, format_tags(state.tags)) for state in states]
     return render_table(STATUS_TABLE_HEADERS, rows)
+
+
+def select_vms_by_tag(states: list[VmState], tag_key: str, tag_value: str) -> list[VmState]:
+    return [state for state in states if state.tags.get(tag_key) == tag_value]
+
+
+def needs_power_action(state: VmState, action: PowerAction) -> bool:
+    return state.power_state != TARGET_POWER_STATES[action]
+
+
+def apply_power_action(
+    client: ComputeManagementClient, resource_group: str, vm_names: list[str], action: PowerAction
+) -> None:
+    """Run the action on all VMs and block until every operation has finished."""
+    begin_operation = {
+        PowerAction.START: client.virtual_machines.begin_start,
+        PowerAction.DEALLOCATE: client.virtual_machines.begin_deallocate,
+    }[action]
+    # Start every long-running operation before waiting on any, so Azure processes
+    # the VMs in parallel instead of one after another.
+    pollers = [begin_operation(resource_group, vm_name) for vm_name in vm_names]
+    for poller in pollers:
+        poller.result()
 
 
 def _read_power_state(statuses: Iterable | None) -> str:
