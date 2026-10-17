@@ -16,6 +16,7 @@ from azure.mgmt.resource.resources import ResourceManagementClient
 from dotenv import load_dotenv
 
 from opsctl.config import Config, ConfigError, load_config
+from opsctl.health import check_dns, check_http, health_url
 from opsctl.inventory import REPORT_SERIALIZERS, format_table, list_resources, save_report
 from opsctl.metrics import MetricStatus, evaluate, fetch_vm_metrics, format_metrics_table
 from opsctl.vms import (
@@ -42,7 +43,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     try:
         config = load_config(os.environ)
         with DefaultAzureCredential() as credential:
-            args.handler(args, config, credential)
+            exit_code = args.handler(args, config, credential)
     except ConfigError as error:
         _print_error(f"configuration error: {error}")
         return EXIT_FAILURE
@@ -56,7 +57,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except HttpResponseError as error:
         _print_error(f"Azure request failed: {error.message}")
         return EXIT_FAILURE
-    return EXIT_SUCCESS
+    return exit_code
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -68,7 +69,23 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_inventory_command(subcommands)
     _add_vm_commands(subcommands)
     _add_metrics_command(subcommands)
+    _add_health_command(subcommands)
     return parser
+
+
+def _add_health_command(subcommands: argparse._SubParsersAction) -> None:
+    health_parser = subcommands.add_parser("health", help="check DNS resolution and the HTTP health endpoint")
+    health_parser.add_argument(
+        "--host", required=True, type=_parse_host, help="hostname or IP address of the server"
+    )
+    health_parser.set_defaults(handler=_run_health)
+
+
+def _parse_host(text: str) -> str:
+    host = text.strip()
+    if not host or "/" in host or ":" in host:
+        raise argparse.ArgumentTypeError(f"expected a hostname or IPv4 address without scheme or path, got {text!r}")
+    return host
 
 
 def _add_metrics_command(subcommands: argparse._SubParsersAction) -> None:
@@ -118,40 +135,42 @@ def _parse_tag(text: str) -> tuple[str, str]:
     return key.strip(), value.strip()
 
 
-def _run_inventory(args: argparse.Namespace, config: Config, credential: TokenCredential) -> None:
+def _run_inventory(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
     with ResourceManagementClient(credential, config.subscription_id) as client:
         records = list_resources(client, config.resource_group)
 
     if not records:
         print(f"No resources found in {config.resource_group}.")
-        return
+        return EXIT_SUCCESS
 
     print(format_table(records))
     if args.output:
         content = REPORT_SERIALIZERS[args.output](records)
         report_path = save_report(content, args.output, REPORTS_DIR, datetime.now(timezone.utc))
         print(f"\nSaved {args.output.upper()} report to {report_path}")
+    return EXIT_SUCCESS
 
 
-def _run_vm_status(args: argparse.Namespace, config: Config, credential: TokenCredential) -> None:
+def _run_vm_status(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
     with ComputeManagementClient(credential, config.subscription_id) as client:
         states = list_vm_states(client, config.resource_group)
 
     if not states:
         print(f"No virtual machines found in {config.resource_group}.")
-        return
+        return EXIT_SUCCESS
 
     print(format_status_table(states))
+    return EXIT_SUCCESS
 
 
-def _run_vm_power_action(args: argparse.Namespace, config: Config, credential: TokenCredential) -> None:
+def _run_vm_power_action(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
     action: PowerAction = args.power_action
     tag_key, tag_value = args.tag
     with ComputeManagementClient(credential, config.subscription_id) as client:
         states = select_vms_by_tag(list_vm_states(client, config.resource_group), tag_key, tag_value)
         if not states:
             print(f"No VMs tagged {tag_key}={tag_value} in {config.resource_group}.")
-            return
+            return EXIT_SUCCESS
 
         pending_states = [state for state in states if needs_power_action(state, action)]
         for state in states:
@@ -161,16 +180,17 @@ def _run_vm_power_action(args: argparse.Namespace, config: Config, credential: T
         if args.dry_run:
             for state in pending_states:
                 print(f"[dry-run] would {action.value} {state.name} (currently {state.power_state})")
-            return
+            return EXIT_SUCCESS
 
         if pending_states:
             vm_names = [state.name for state in pending_states]
             print(f"{PROGRESS_MESSAGES[action]} {', '.join(vm_names)}...")
             apply_power_action(client, config.resource_group, vm_names, action)
             print("Done.")
+    return EXIT_SUCCESS
 
 
-def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCredential) -> None:
+def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
     with (
         ComputeManagementClient(credential, config.subscription_id) as compute_client,
         MonitorManagementClient(credential, config.subscription_id) as monitor_client,
@@ -181,7 +201,7 @@ def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCred
 
     if not metrics_by_vm:
         print(f"No virtual machines found in {config.resource_group}.")
-        return
+        return EXIT_SUCCESS
 
     print(format_metrics_table(metrics_by_vm, config.cpu_threshold_percent))
     statuses = {
@@ -193,6 +213,23 @@ def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCred
         print(f"\nCPU average above {config.cpu_threshold_percent:g}% threshold.")
     if MetricStatus.NO_DATA in statuses:
         print("\nSome metrics have no data yet; a VM that just started needs a few minutes.")
+    return EXIT_SUCCESS
+
+
+def _run_health(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
+    dns_result = check_dns(args.host)
+    if not dns_result.is_healthy:
+        print(f"DNS   {args.host}: FAIL ({dns_result.error})")
+        return EXIT_FAILURE
+    print(f"DNS   {args.host} -> {dns_result.ip_address}: OK")
+
+    http_result = check_http(health_url(args.host))
+    if not http_result.is_healthy:
+        reason = http_result.error or f"status {http_result.status_code}"
+        print(f"HTTP  {http_result.url}: FAIL ({reason})")
+        return EXIT_FAILURE
+    print(f"HTTP  {http_result.url}: OK ({http_result.status_code}, {http_result.elapsed_ms:.0f} ms)")
+    return EXIT_SUCCESS
 
 
 def _print_error(message: str) -> None:

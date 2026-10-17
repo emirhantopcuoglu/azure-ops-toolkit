@@ -5,6 +5,7 @@ import pytest
 from azure.core.exceptions import ClientAuthenticationError, ResourceNotFoundError
 
 import opsctl.__main__ as cli
+from opsctl.health import DnsResult, HttpResult
 
 VALID_SUBSCRIPTION_ID = "00000000-0000-0000-0000-000000000000"
 
@@ -209,3 +210,49 @@ def test_metrics_prints_table_and_flags_cpu_above_threshold(compute_client, monk
     output = capsys.readouterr().out
     assert "vm-ops-01  Percentage CPU  92.0%  99.0%  WARN" in output
     assert "CPU average above 80% threshold" in output
+
+
+def test_health_succeeds_when_dns_and_http_are_healthy(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "check_dns", lambda host: DnsResult(host=host, ip_address="20.0.0.1", error=None))
+    monkeypatch.setattr(
+        cli, "check_http", lambda url: HttpResult(url=url, status_code=200, elapsed_ms=38.4, error=None)
+    )
+
+    exit_code = cli.main(["health", "--host", "vm.example.com"])
+
+    assert exit_code == cli.EXIT_SUCCESS
+    output = capsys.readouterr().out
+    assert "DNS   vm.example.com -> 20.0.0.1: OK" in output
+    assert "HTTP  http://vm.example.com/healthz: OK (200, 38 ms)" in output
+
+
+def test_health_fails_without_http_check_when_dns_fails(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "check_dns", lambda host: DnsResult(host=host, ip_address=None, error="not known"))
+    check_http = Mock()
+    monkeypatch.setattr(cli, "check_http", check_http)
+
+    exit_code = cli.main(["health", "--host", "missing.example.com"])
+
+    assert exit_code == cli.EXIT_FAILURE
+    assert "DNS   missing.example.com: FAIL (not known)" in capsys.readouterr().out
+    check_http.assert_not_called()
+
+
+def test_health_fails_when_endpoint_does_not_return_200(monkeypatch, capsys):
+    monkeypatch.setattr(cli, "check_dns", lambda host: DnsResult(host=host, ip_address=host, error=None))
+    monkeypatch.setattr(
+        cli, "check_http", lambda url: HttpResult(url=url, status_code=502, elapsed_ms=12.0, error=None)
+    )
+
+    exit_code = cli.main(["health", "--host", "20.0.0.1"])
+
+    assert exit_code == cli.EXIT_FAILURE
+    assert "HTTP  http://20.0.0.1/healthz: FAIL (status 502)" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("host", ["", "http://20.0.0.1", "20.0.0.1/healthz", "20.0.0.1:80"])
+def test_health_rejects_host_with_scheme_path_or_port(host):
+    with pytest.raises(SystemExit) as exit_info:
+        cli.main(["health", "--host", host])
+
+    assert exit_info.value.code == 2
