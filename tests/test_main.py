@@ -183,3 +183,29 @@ def test_vm_power_commands_require_a_key_value_tag(arguments):
         cli.main(arguments)
 
     assert exit_info.value.code == 2
+
+
+def test_metrics_prints_table_and_flags_cpu_above_threshold(compute_client, monkeypatch, capsys):
+    # Arrange
+    compute_client.virtual_machines.list.return_value = [SimpleNamespace(name="vm-ops-01", id="/vms/vm-ops-01")]
+    monitor_client = MagicMock()
+    monitor_client.__enter__.return_value = monitor_client
+    monitor_client.metrics.list.return_value = SimpleNamespace(
+        value=[
+            SimpleNamespace(
+                name=SimpleNamespace(value="Percentage CPU"),
+                unit="Percent",
+                timeseries=[SimpleNamespace(data=[SimpleNamespace(average=92.0, maximum=99.0)])],
+            )
+        ]
+    )
+    monkeypatch.setattr(cli, "MonitorManagementClient", Mock(return_value=monitor_client))
+
+    # Act
+    exit_code = cli.main(["metrics"])
+
+    # Assert
+    assert exit_code == cli.EXIT_SUCCESS
+    output = capsys.readouterr().out
+    assert "vm-ops-01  Percentage CPU  92.0%  99.0%  WARN" in output
+    assert "CPU average above 80% threshold" in output

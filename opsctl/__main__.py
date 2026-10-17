@@ -11,11 +11,13 @@ from azure.core.credentials import TokenCredential
 from azure.core.exceptions import ClientAuthenticationError, HttpResponseError
 from azure.identity import DefaultAzureCredential
 from azure.mgmt.compute import ComputeManagementClient
+from azure.mgmt.monitor import MonitorManagementClient
 from azure.mgmt.resource.resources import ResourceManagementClient
 from dotenv import load_dotenv
 
 from opsctl.config import Config, ConfigError, load_config
 from opsctl.inventory import REPORT_SERIALIZERS, format_table, list_resources, save_report
+from opsctl.metrics import MetricStatus, evaluate, fetch_vm_metrics, format_metrics_table
 from opsctl.vms import (
     PowerAction,
     apply_power_action,
@@ -65,7 +67,15 @@ def _build_parser() -> argparse.ArgumentParser:
     subcommands = parser.add_subparsers(dest="command", required=True)
     _add_inventory_command(subcommands)
     _add_vm_commands(subcommands)
+    _add_metrics_command(subcommands)
     return parser
+
+
+def _add_metrics_command(subcommands: argparse._SubParsersAction) -> None:
+    metrics_parser = subcommands.add_parser(
+        "metrics", help="show last-hour CPU, network and disk metrics with a CPU threshold check"
+    )
+    metrics_parser.set_defaults(handler=_run_metrics)
 
 
 def _add_inventory_command(subcommands: argparse._SubParsersAction) -> None:
@@ -158,6 +168,31 @@ def _run_vm_power_action(args: argparse.Namespace, config: Config, credential: T
             print(f"{PROGRESS_MESSAGES[action]} {', '.join(vm_names)}...")
             apply_power_action(client, config.resource_group, vm_names, action)
             print("Done.")
+
+
+def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCredential) -> None:
+    with (
+        ComputeManagementClient(credential, config.subscription_id) as compute_client,
+        MonitorManagementClient(credential, config.subscription_id) as monitor_client,
+    ):
+        metrics_by_vm = fetch_vm_metrics(
+            compute_client, monitor_client, config.resource_group, datetime.now(timezone.utc)
+        )
+
+    if not metrics_by_vm:
+        print(f"No virtual machines found in {config.resource_group}.")
+        return
+
+    print(format_metrics_table(metrics_by_vm, config.cpu_threshold_percent))
+    statuses = {
+        evaluate(summary, config.cpu_threshold_percent)
+        for summaries in metrics_by_vm.values()
+        for summary in summaries
+    }
+    if MetricStatus.WARN in statuses:
+        print(f"\nCPU average above {config.cpu_threshold_percent:g}% threshold.")
+    if MetricStatus.NO_DATA in statuses:
+        print("\nSome metrics have no data yet; a VM that just started needs a few minutes.")
 
 
 def _print_error(message: str) -> None:
