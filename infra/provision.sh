@@ -22,6 +22,11 @@ az group create \
   --tags project=azure-ops-toolkit env=dev \
   --output none
 
+# New subscriptions do not have Azure Monitor registered; without it metric queries
+# fail with a misleading "resource mapping not found" error. No-op if already registered.
+echo "Registering the Microsoft.Insights resource provider (Azure Monitor)..."
+az provider register --namespace Microsoft.Insights --wait
+
 echo "Creating VM '${VM_NAME}' (${VM_SIZE})..."
 az vm create \
   --resource-group "${RESOURCE_GROUP}" \
