@@ -16,6 +16,7 @@ from azure.mgmt.resource.resources import ResourceManagementClient
 from dotenv import load_dotenv
 
 from opsctl.config import Config, ConfigError, load_config
+from opsctl.health import check_dns, check_http, health_url
 from opsctl.inventory import REPORT_SERIALIZERS, format_table, list_resources, save_report
 from opsctl.metrics import MetricStatus, evaluate, fetch_vm_metrics, format_metrics_table
 from opsctl.vms import (
@@ -68,7 +69,23 @@ def _build_parser() -> argparse.ArgumentParser:
     _add_inventory_command(subcommands)
     _add_vm_commands(subcommands)
     _add_metrics_command(subcommands)
+    _add_health_command(subcommands)
     return parser
+
+
+def _add_health_command(subcommands: argparse._SubParsersAction) -> None:
+    health_parser = subcommands.add_parser("health", help="check DNS resolution and the HTTP health endpoint")
+    health_parser.add_argument(
+        "--host", required=True, type=_parse_host, help="hostname or IP address of the server"
+    )
+    health_parser.set_defaults(handler=_run_health)
+
+
+def _parse_host(text: str) -> str:
+    host = text.strip()
+    if not host or "/" in host or ":" in host:
+        raise argparse.ArgumentTypeError(f"expected a hostname or IPv4 address without scheme or path, got {text!r}")
+    return host
 
 
 def _add_metrics_command(subcommands: argparse._SubParsersAction) -> None:
@@ -196,6 +213,22 @@ def _run_metrics(args: argparse.Namespace, config: Config, credential: TokenCred
         print(f"\nCPU average above {config.cpu_threshold_percent:g}% threshold.")
     if MetricStatus.NO_DATA in statuses:
         print("\nSome metrics have no data yet; a VM that just started needs a few minutes.")
+    return EXIT_SUCCESS
+
+
+def _run_health(args: argparse.Namespace, config: Config, credential: TokenCredential) -> int:
+    dns_result = check_dns(args.host)
+    if not dns_result.is_healthy:
+        print(f"DNS   {args.host}: FAIL ({dns_result.error})")
+        return EXIT_FAILURE
+    print(f"DNS   {args.host} -> {dns_result.ip_address}: OK")
+
+    http_result = check_http(health_url(args.host))
+    if not http_result.is_healthy:
+        reason = http_result.error or f"status {http_result.status_code}"
+        print(f"HTTP  {http_result.url}: FAIL ({reason})")
+        return EXIT_FAILURE
+    print(f"HTTP  {http_result.url}: OK ({http_result.status_code}, {http_result.elapsed_ms:.0f} ms)")
     return EXIT_SUCCESS
 
 
