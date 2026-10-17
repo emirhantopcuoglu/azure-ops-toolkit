@@ -2,6 +2,7 @@
 # Lets GitHub Actions sign in to Azure through OIDC federation: GitHub presents a
 # short-lived token for this repository and branch, so no client secret exists.
 # The identity can only manage VMs in the project resource group.
+# Requires an authenticated Azure CLI (az login) and GitHub CLI (gh auth login).
 set -euo pipefail
 
 RESOURCE_GROUP="${RESOURCE_GROUP:-rg-ops-toolkit}"
@@ -38,15 +39,24 @@ MSYS_NO_PATHCONV=1 az role assignment create \
   --scope "${RESOURCE_GROUP_ID}" \
   --output none
 
-if ! az ad app federated-credential show --id "${APP_ID}" \
+# Ask GitHub for the exact subject prefix instead of assuming "repo:<owner>/<name>".
+# Repositories using immutable subjects embed the owner and repository IDs
+# ("repo:owner@123/name@456"), so a renamed or re-created repository cannot reuse the trust.
+SUBJECT_PREFIX="$(gh api "repos/${GITHUB_REPOSITORY}/actions/oidc/customization/sub" --jq .sub_claim_prefix)"
+FEDERATED_CREDENTIAL_JSON="{
+  \"name\": \"${FEDERATED_CREDENTIAL_NAME}\",
+  \"issuer\": \"${GITHUB_OIDC_ISSUER}\",
+  \"subject\": \"${SUBJECT_PREFIX}:ref:refs/heads/${GITHUB_BRANCH}\",
+  \"audiences\": [\"${AZURE_TOKEN_EXCHANGE_AUDIENCE}\"]
+}"
+
+echo "Trusting GitHub Actions tokens with subject '${SUBJECT_PREFIX}:ref:refs/heads/${GITHUB_BRANCH}'..."
+if az ad app federated-credential show --id "${APP_ID}" \
   --federated-credential-id "${FEDERATED_CREDENTIAL_NAME}" --output none 2>/dev/null; then
-  echo "Trusting GitHub Actions tokens from ${GITHUB_REPOSITORY}@${GITHUB_BRANCH}..."
-  az ad app federated-credential create --id "${APP_ID}" --output none --parameters "{
-    \"name\": \"${FEDERATED_CREDENTIAL_NAME}\",
-    \"issuer\": \"${GITHUB_OIDC_ISSUER}\",
-    \"subject\": \"repo:${GITHUB_REPOSITORY}:ref:refs/heads/${GITHUB_BRANCH}\",
-    \"audiences\": [\"${AZURE_TOKEN_EXCHANGE_AUDIENCE}\"]
-  }"
+  az ad app federated-credential update --id "${APP_ID}" \
+    --federated-credential-id "${FEDERATED_CREDENTIAL_NAME}" --parameters "${FEDERATED_CREDENTIAL_JSON}" --output none
+else
+  az ad app federated-credential create --id "${APP_ID}" --parameters "${FEDERATED_CREDENTIAL_JSON}" --output none
 fi
 
 echo
