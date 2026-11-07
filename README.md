@@ -60,7 +60,7 @@ opsctl/
   formatting.py           table and unit formatting
 tests/                    unit tests
 deploy/systemd/           opsctl-report.service, opsctl-report.timer
-.github/workflows/        nightly-shutdown.yml
+.github/workflows/        nightly-shutdown.yml, tests.yml
 Dockerfile
 ```
 
@@ -170,6 +170,7 @@ python -m pytest
 ```
 
 Unit tests mock the Azure SDK clients, HTTP, DNS and time, and do not require network access.
+GitHub Actions runs them on every push and pull request to `main` and `develop`.
 
 ## Teardown
 
