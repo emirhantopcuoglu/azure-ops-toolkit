@@ -1,0 +1,29 @@
+name: Tests
+
+# Runs the unit tests on every change that targets the long-lived branches. Feature branches are
+# covered by the pull_request trigger, so a failing change is caught before it is merged.
+on:
+  push:
+    branches: [main, develop]
+  pull_request:
+    branches: [main, develop]
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - run: pip install -r requirements-dev.txt
+
+      # The tests mock the Azure SDK, HTTP, DNS and time, so no Azure credentials are needed here
+      - run: python -m pytest
